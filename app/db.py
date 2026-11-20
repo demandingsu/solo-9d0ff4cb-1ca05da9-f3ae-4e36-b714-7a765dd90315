@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inspections (
@@ -36,6 +36,32 @@ CREATE INDEX IF NOT EXISTS idx_segments_inspection
     ON segments(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_segments_report
     ON segments(report_id);
+
+CREATE TABLE IF NOT EXISTS roll_series (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_thickness  INTEGER NOT NULL CHECK (target_thickness >= 0),
+    tolerance         INTEGER NOT NULL CHECK (tolerance >= 0),
+    alarm_threshold   INTEGER NOT NULL CHECK (alarm_threshold > 0),
+    note              TEXT,
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS roll_readings (
+    series_id         INTEGER NOT NULL
+                          REFERENCES roll_series(id) ON DELETE CASCADE,
+    roll_index        INTEGER NOT NULL CHECK (roll_index >= 1),
+    measured          INTEGER NOT NULL CHECK (measured >= 0),
+    inspection_id     INTEGER NOT NULL REFERENCES inspections(id),
+    cumulative_after  INTEGER NOT NULL CHECK (cumulative_after >= 0),
+    alarmed           INTEGER NOT NULL CHECK (alarmed IN (0, 1)),
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (series_id, roll_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_roll_readings_inspection
+    ON roll_readings(inspection_id);
+CREATE INDEX IF NOT EXISTS idx_roll_readings_alarmed
+    ON roll_readings(series_id, alarmed);
 """
 
 
@@ -183,3 +209,224 @@ def get_reports(connection: sqlite3.Connection, inspection_id: int) -> list[dict
         }
         for report in reports
     ]
+
+
+# ---------------------------------------------------------------------------
+# 卷序监测
+# ---------------------------------------------------------------------------
+
+
+def create_roll_series(
+    connection: sqlite3.Connection,
+    target_thickness: int,
+    tolerance: int,
+    alarm_threshold: int,
+    note: str | None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO roll_series
+            (target_thickness, tolerance, alarm_threshold, note, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (target_thickness, tolerance, alarm_threshold, note, now()),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_roll_series(connection: sqlite3.Connection, series_id: int) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT s.id, s.target_thickness, s.tolerance, s.alarm_threshold, s.note,
+               s.created_at,
+               (SELECT COUNT(*) FROM roll_readings r WHERE r.series_id = s.id)
+                   AS reading_count,
+               (SELECT COUNT(*) FROM roll_readings r
+                    WHERE r.series_id = s.id AND r.alarmed = 1)
+                   AS alarm_count
+        FROM roll_series s
+        WHERE s.id = ?
+        """,
+        (series_id,),
+    ).fetchone()
+
+
+def list_roll_series(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT s.id, s.target_thickness, s.tolerance, s.alarm_threshold, s.note,
+               s.created_at,
+               (SELECT COUNT(*) FROM roll_readings r WHERE r.series_id = s.id)
+                   AS reading_count,
+               (SELECT COUNT(*) FROM roll_readings r
+                    WHERE r.series_id = s.id AND r.alarmed = 1)
+                   AS alarm_count
+        FROM roll_series s
+        ORDER BY s.id
+        """
+    ).fetchall()
+
+
+def get_roll_reading(
+    connection: sqlite3.Connection, series_id: int, roll_index: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT series_id, roll_index, measured, inspection_id,
+               cumulative_after, alarmed, updated_at
+        FROM roll_readings
+        WHERE series_id = ? AND roll_index = ?
+        """,
+        (series_id, roll_index),
+    ).fetchone()
+
+
+def get_roll_state(
+    connection: sqlite3.Connection, series_id: int, roll_index: int
+) -> tuple[int, bool] | None:
+    """按键取一卷的已存状态；不存在时返回 ``None``。"""
+    row = connection.execute(
+        """
+        SELECT cumulative_after, alarmed
+        FROM roll_readings
+        WHERE series_id = ? AND roll_index = ?
+        """,
+        (series_id, roll_index),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["cumulative_after"]), bool(row["alarmed"])
+
+
+def get_state_before(
+    connection: sqlite3.Connection, series_id: int, roll_index: int
+) -> int:
+    """取 ``roll_index`` 之前最近一卷的累计值；没有更早的卷时为 0。
+
+    单行按键查询，不扫描先前各卷。
+    """
+    row = connection.execute(
+        """
+        SELECT cumulative_after
+        FROM roll_readings
+        WHERE series_id = ? AND roll_index < ?
+        ORDER BY roll_index DESC
+        LIMIT 1
+        """,
+        (series_id, roll_index),
+    ).fetchone()
+    return int(row["cumulative_after"]) if row is not None else 0
+
+
+def iter_roll_readings_from(
+    connection: sqlite3.Connection, series_id: int, from_roll_index: int
+) -> Iterator[tuple[int, int]]:
+    """惰性逐行取出后缀各卷的 ``(roll_index, measured)``。
+
+    回放一旦收敛，调用方即停止迭代并关闭生成器，余下各卷既不会从数据库
+    拉取，也不会参与计算。
+    """
+    cursor = connection.execute(
+        """
+        SELECT roll_index, measured
+        FROM roll_readings
+        WHERE series_id = ? AND roll_index >= ?
+        ORDER BY roll_index
+        """,
+        (series_id, from_roll_index),
+    )
+    try:
+        for row in cursor:
+            yield int(row["roll_index"]), int(row["measured"])
+    finally:
+        cursor.close()
+
+
+def upsert_roll_reading(
+    connection: sqlite3.Connection,
+    series_id: int,
+    roll_index: int,
+    measured: int,
+    inspection_id: int,
+    cumulative_after: int,
+    alarmed: bool,
+) -> None:    connection.execute(
+        """
+        INSERT INTO roll_readings
+            (series_id, roll_index, measured, inspection_id,
+             cumulative_after, alarmed, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (series_id, roll_index) DO UPDATE SET
+            measured = excluded.measured,
+            inspection_id = excluded.inspection_id,
+            cumulative_after = excluded.cumulative_after,
+            alarmed = excluded.alarmed,
+            updated_at = excluded.updated_at
+        """,
+        (
+            series_id,
+            roll_index,
+            measured,
+            inspection_id,
+            cumulative_after,
+            1 if alarmed else 0,
+            now(),
+        ),
+    )
+
+
+def delete_roll_reading(
+    connection: sqlite3.Connection, series_id: int, roll_index: int
+) -> None:
+    connection.execute(
+        "DELETE FROM roll_readings WHERE series_id = ? AND roll_index = ?",
+        (series_id, roll_index),
+    )
+
+
+def update_roll_state(
+    connection: sqlite3.Connection,
+    series_id: int,
+    roll_index: int,
+    cumulative_after: int,
+    alarmed: bool,
+    updated_at: str,
+) -> None:
+    """只更新一卷的累计值与报警标记，读数与关联登记号保持不变。"""
+    connection.execute(
+        """
+        UPDATE roll_readings
+        SET cumulative_after = ?, alarmed = ?, updated_at = ?
+        WHERE series_id = ? AND roll_index = ?
+        """,
+        (
+            cumulative_after,
+            1 if alarmed else 0,
+            updated_at,
+            series_id,
+            roll_index,
+        ),
+    )
+
+
+def list_roll_readings(
+    connection: sqlite3.Connection, series_id: int
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT r.series_id, r.roll_index, r.measured, r.inspection_id,
+               r.cumulative_after, r.alarmed, r.updated_at, i.note AS inspection_note
+        FROM roll_readings r
+        JOIN inspections i ON i.id = r.inspection_id
+        WHERE r.series_id = ?
+        ORDER BY r.roll_index
+        """,
+        (series_id,),
+    ).fetchall()
+
+
+def inspection_exists(connection: sqlite3.Connection, inspection_id: int) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM inspections WHERE id = ?", (inspection_id,)
+    ).fetchone()
+    return row is not None
